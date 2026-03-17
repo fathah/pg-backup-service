@@ -2,25 +2,23 @@
 
 A Go-based service designed to automate full PostgreSQL database dumps and securely upload them to [ZDrive](https://ziqx.cc/drive).
 
-## Features
+## Quick Start (VPS)
 
-- **Database Discovery**: Automatically identifies all user-created databases on the server.
-- **Granular Backups**: Per-database exports using `pg_dump` for easier restoration.
-- **Global Data**: Captures roles, users, and groups using `pg_dumpall --globals-only`.
-- **Hybrid Fallback**: Automatically falls back to a full `pg_dumpall` if database discovery fails.
-- **Secure Upload**: Integrates with the ZDrive API using signed URLs for secure multipart transfers.
-- **Configurable**: Managed entirely via environment variables.
-- **Automated Builds**: Includes a GitHub Action for building Ubuntu-compatible binaries.
-- **Cron Ready**: Designed for easy integration with standard cron jobs.
+### 1. Direct Download
 
-## Prerequisites
+You can download the pre-built binary directly to your VPS:
 
-- **Go**: 1.24 or higher (for building).
-- **PostgreSQL Client Tools**: The `pg_dumpall` utility must be installed on the machine running the service.
+```bash
+# Using wget
+wget https://github.com/fathah/pg-backup-service/releases/latest/download/pg-backup-service && chmod +x pg-backup-service
 
-## Configuration
+# Using curl
+curl -L -O https://github.com/fathah/pg-backup-service/releases/latest/download/pg-backup-service && chmod +x pg-backup-service
+```
 
-The service is configured via environment variables. You can use a `.env` file for local development or set them in your deployment environment.
+### 2. Configuration
+
+Create a `.env` file or export environment variables:
 
 | Variable        | Description                    | Default     |
 | --------------- | ------------------------------ | ----------- |
@@ -32,7 +30,24 @@ The service is configured via environment variables. You can use a `.env` file f
 | `ZDRIVE_SECRET` | Your ZDrive secret (Required)  | -           |
 | `BACKUP_PREFIX` | Prefix for the backup filename | `pg_backup` |
 
-## Usage
+### 3. Running
+
+```bash
+./pg-backup-service
+```
+
+### 4. Daily Backups (Cron)
+
+To schedule daily backups, refer to the [cronjob.md](./cronjob.md) file for setup instructions and a wrapper script.
+
+---
+
+## Development & Build from Source
+
+### Prerequisites
+
+- **Go**: 1.24 or higher.
+- **PostgreSQL Client Tools**: The `pg_dumpall` utility must be installed.
 
 ### Local Build
 
@@ -40,24 +55,19 @@ The service is configured via environment variables. You can use a `.env` file f
 go build -o pg-backup-service main.go
 ```
 
-### Running the Service
+### CI/CD / GitHub Workflow
 
-Ensure your environment variables are set, then run:
+A workflow is included in `.github/workflows/build.yml` that builds a Linux binary on every push to the `main` branch.
 
-```bash
-./pg-backup-service
-```
+## Features
 
-## Automation
-
-### GitHub Workflow
-
-A workflow is included in `.github/workflows/build.yml` that builds a Linux binary on every push to the `main` branch. The resulting binary is uploaded as a GitHub Action artifact.
-
-### Cron Job
-
-To schedule daily backups at 2 AM IST (8:30 PM UTC), refer to the [cronjob.md](./cronjob.md) file for setup instructions and a wrapper script.
+- **Database Discovery**: Automatically identifies all user-created databases on the server.
+- **Granular Backups**: Per-database exports using `pg_dump` for easier restoration.
+- **Global Data**: Captures roles, users, and groups using `pg_dumpall --globals-only`.
+- **Hybrid Fallback**: Automatically falls back to a full `pg_dumpall` if database discovery fails.
+- **Secure Upload**: Integrates with the ZDrive API using signed URLs for secure multipart transfers.
+- **Configurable**: Managed entirely via environment variables.
 
 ## License
 
-MIT
+MIT [LICENSE](./LICENSE)
