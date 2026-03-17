@@ -4,9 +4,12 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: write
+
 jobs:
   build:
-    name: Build
+    name: Build and Release
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -25,8 +28,13 @@ jobs:
         run: |
           GOOS=linux GOARCH=amd64 go build -o pg-backup-service main.go
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: pg-backup-service-linux
-          path: pg-backup-service
+          tag_name: v1.0.${{ github.run_number }}
+          name: Release v1.0.${{ github.run_number }}
+          files: pg-backup-service
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
