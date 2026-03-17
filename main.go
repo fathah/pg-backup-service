@@ -204,7 +204,8 @@ type SignedURLResponse struct {
 }
 
 func getSignedURL(config Config, filename string) (string, error) {
-	url := fmt.Sprintf("https://ziqx.cc/api/drive/sign-url?filename=%s", filename)
+	date := time.Now().Format("20060102")
+	url := fmt.Sprintf("https://ziqx.cc/api/drive/sign-url?filename=%s&folder=%s", filename, date)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return "", err
