@@ -1,0 +1,12 @@
+.git
+.gitignore
+.env
+.env.*
+*.log
+*.sql
+README.md
+cronjob.md
+LICENSE
+Dockerfile
+docker-compose.yml
+.dockerignore

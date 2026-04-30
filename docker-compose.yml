@@ -1,0 +1,7 @@
+services:
+  pg-backup:
+    image: ghcr.io/fathah/pg-backup-service:latest
+    container_name: pg-backup-service
+    restart: unless-stopped
+    env_file:
+      - .env

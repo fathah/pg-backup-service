@@ -38,7 +38,20 @@ Create a `.env` file or export environment variables:
 
 ### 4. Daily Backups (Cron)
 
-To schedule daily backups, refer to the [cronjob.md](./cronjob.md) file for setup instructions and a wrapper script.
+For host-cron setup with the binary, see [cronjob.md](./cronjob.md). If you'd rather skip host cron entirely, the Docker image below has a scheduler built in.
+
+---
+
+## Docker (recommended)
+
+A pre-built Docker image is published to GitHub Container Registry. It bundles the PostgreSQL client tools and a built-in cron scheduler ([supercronic](https://github.com/aptible/supercronic)) — one container handles both the backup and the schedule.
+
+```bash
+cp .env.example .env       # then fill in values
+docker compose up -d       # pulls ghcr.io/fathah/pg-backup-service:latest
+```
+
+By default it runs every day at 20:30 UTC (`CRON_SCHEDULE=30 20 * * *`). For setup details, scheduling syntax, host vs. container Postgres, and operations, see [docker.md](./docker.md).
 
 ---
 
@@ -57,7 +70,10 @@ go build -o pg-backup-service main.go
 
 ### CI/CD / GitHub Workflow
 
-A workflow is included in `.github/workflows/build.yml` that builds a Linux binary on every push to the `main` branch.
+A workflow at [`.github/workflows/build.yml`](./.github/workflows/build.yml) runs on every push to the `release` branch:
+
+- Builds a Linux binary and publishes it as a GitHub Release.
+- Builds a multi-arch (amd64/arm64) Docker image and pushes it to `ghcr.io/fathah/pg-backup-service` tagged `latest`, `r<run_number>`, and `sha-<short-sha>`.
 
 ## Features
 

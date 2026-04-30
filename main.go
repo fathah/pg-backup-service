@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"time"
 )
 
@@ -43,6 +45,14 @@ func loadConfig() Config {
 	}
 }
 
+type dumpMode int
+
+const (
+	dumpModeSingle dumpMode = iota
+	dumpModeAll
+	dumpModeGlobals
+)
+
 func main() {
 	config := loadConfig()
 
@@ -50,62 +60,50 @@ func main() {
 		log.Fatal("PG_PASSWORD, ZDRIVE_KEY, and ZDRIVE_SECRET must be set")
 	}
 
-	timestamp := time.Now().Format("20060102_150405")
+	timestamp := time.Now().UTC().Format("20060102_150405")
 
-	// 1. Get list of databases (optional, can fallback to dumpall if discovery fails)
 	databases, err := getDatabaseList(config)
 	if err != nil {
-		log.Printf("Warning: Database discovery failed: %v. Falling back to single pg_dumpall.", err)
-		performSingleFullBackup(config, timestamp)
+		log.Printf("Warning: database discovery failed: %v. Falling back to single pg_dumpall.", err)
+		filename := fmt.Sprintf("%s_%s_full.sql.gz", config.BackupPrefix, timestamp)
+		if err := performBackupAndUpload(config, filename, dumpModeAll, ""); err != nil {
+			log.Fatalf("Critical: fallback backup failed: %v", err)
+		}
 		return
 	}
 
 	log.Printf("Found %d databases: %v", len(databases), databases)
 
-	// 2. Perform Global Backup (Roles/Users)
-	globalFilename := fmt.Sprintf("%s_%s_globals.sql", config.BackupPrefix, timestamp)
-	err = performBackupAndUpload(config, globalFilename, true, "")
-	if err != nil {
-		log.Printf("Error: Failed to backup global data: %v", err)
+	failures := 0
+
+	globalFilename := fmt.Sprintf("%s_%s_globals.sql.gz", config.BackupPrefix, timestamp)
+	if err := performBackupAndUpload(config, globalFilename, dumpModeGlobals, ""); err != nil {
+		log.Printf("Error: failed to backup global data: %v", err)
+		failures++
 	}
 
-	// 3. Perform Per-Database Backups
 	for _, db := range databases {
-		dbFilename := fmt.Sprintf("%s_%s_db_%s.sql", config.BackupPrefix, timestamp, db)
-		err = performBackupAndUpload(config, dbFilename, false, db)
-		if err != nil {
-			log.Printf("Error: Failed to backup database %s: %v", db, err)
+		dbFilename := fmt.Sprintf("%s_%s_db_%s.sql.gz", config.BackupPrefix, timestamp, safeFileSegment(db))
+		if err := performBackupAndUpload(config, dbFilename, dumpModeSingle, db); err != nil {
+			log.Printf("Error: failed to backup database %s: %v", db, err)
+			failures++
 			continue
 		}
 	}
 
-	log.Printf("Backup process completed.")
-}
-
-func performSingleFullBackup(config Config, timestamp string) {
-	filename := fmt.Sprintf("%s_%s_full.sql", config.BackupPrefix, timestamp)
-	err := performBackupAndUpload(config, filename, false, "") // empty db means dumpall
-	if err != nil {
-		log.Fatalf("Critical: Failed to perform fallback backup: %v", err)
+	if failures > 0 {
+		log.Fatalf("Backup completed with %d failure(s).", failures)
 	}
+	log.Printf("Backup process completed successfully.")
 }
 
-func performBackupAndUpload(config Config, filename string, isGlobals bool, dbName string) error {
+func performBackupAndUpload(config Config, filename string, mode dumpMode, dbName string) error {
 	tmpPath := filepath.Join(os.TempDir(), filename)
 	defer os.Remove(tmpPath)
 
 	log.Printf("Processing %s...", filename)
 
-	var err error
-	if isGlobals {
-		err = runPgDumpGlobals(config, tmpPath)
-	} else if dbName == "" {
-		err = runPgDumpAll(config, tmpPath)
-	} else {
-		err = runPgDump(config, dbName, tmpPath)
-	}
-
-	if err != nil {
+	if err := dumpToFile(config, mode, dbName, tmpPath); err != nil {
 		return fmt.Errorf("backup failed: %w", err)
 	}
 
@@ -114,8 +112,7 @@ func performBackupAndUpload(config Config, filename string, isGlobals bool, dbNa
 		return fmt.Errorf("signed URL failed: %w", err)
 	}
 
-	err = uploadToZDrive(signedURL, tmpPath, filename)
-	if err != nil {
+	if err := uploadWithRetry(signedURL, tmpPath, filename, 3); err != nil {
 		return fmt.Errorf("upload failed: %w", err)
 	}
 
@@ -123,78 +120,84 @@ func performBackupAndUpload(config Config, filename string, isGlobals bool, dbNa
 	return nil
 }
 
+func dumpToFile(config Config, mode dumpMode, dbName, outputPath string) error {
+	out, err := os.Create(outputPath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	gzWriter := gzip.NewWriter(out)
+
+	var cmd *exec.Cmd
+	switch mode {
+	case dumpModeGlobals:
+		cmd = exec.Command("pg_dumpall",
+			"-h", config.PGHost, "-p", config.PGPort, "-U", config.PGUser,
+			"-w", "--globals-only",
+		)
+	case dumpModeAll:
+		cmd = exec.Command("pg_dumpall",
+			"-h", config.PGHost, "-p", config.PGPort, "-U", config.PGUser, "-w",
+		)
+	case dumpModeSingle:
+		cmd = exec.Command("pg_dump",
+			"-h", config.PGHost, "-p", config.PGPort, "-U", config.PGUser,
+			"-w", "-d", dbName,
+		)
+	default:
+		return fmt.Errorf("unknown dump mode: %d", mode)
+	}
+
+	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", config.PGPassword))
+	cmd.Stdout = gzWriter
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		gzWriter.Close()
+		return fmt.Errorf("%v: %s", err, stderr.String())
+	}
+	if err := gzWriter.Close(); err != nil {
+		return fmt.Errorf("gzip close: %w", err)
+	}
+	return nil
+}
+
 func getDatabaseList(config Config) ([]string, error) {
-	// Query to list all databases except templates and system dbs
-	query := "SELECT datname FROM pg_database WHERE datistemplate = false AND datname NOT IN ('postgres', 'information_schema', 'pg_catalog');"
+	query := "SELECT datname FROM pg_database WHERE datistemplate = false AND datname <> 'postgres';"
 	cmd := exec.Command("psql",
 		"-h", config.PGHost,
 		"-p", config.PGPort,
 		"-U", config.PGUser,
 		"-d", "postgres",
+		"-w",
 		"-t", "-A", "-c", query,
 	)
-
 	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", config.PGPassword))
 
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("%v: %s", err, string(output))
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("%v: %s", err, stderr.String())
 	}
 
-	lines := bytes.Split(bytes.TrimSpace(output), []byte("\n"))
+	lines := bytes.Split(bytes.TrimSpace(stdout.Bytes()), []byte("\n"))
 	var dbs []string
 	for _, line := range lines {
 		if len(line) > 0 {
 			dbs = append(dbs, string(line))
 		}
 	}
-
 	return dbs, nil
 }
 
-func runPgDumpGlobals(config Config, outputPath string) error {
-	cmd := exec.Command("pg_dumpall",
-		"-h", config.PGHost,
-		"-p", config.PGPort,
-		"-U", config.PGUser,
-		"--globals-only",
-		"-f", outputPath,
-	)
-	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", config.PGPassword))
-	return runCmd(cmd)
-}
+var unsafePathChars = regexp.MustCompile(`[^a-zA-Z0-9._-]`)
 
-func runPgDump(config Config, dbName, outputPath string) error {
-	cmd := exec.Command("pg_dump",
-		"-h", config.PGHost,
-		"-p", config.PGPort,
-		"-U", config.PGUser,
-		"-d", dbName,
-		"-f", outputPath,
-	)
-	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", config.PGPassword))
-	return runCmd(cmd)
-}
-
-func runPgDumpAll(config Config, outputPath string) error {
-	cmd := exec.Command("pg_dumpall",
-		"-h", config.PGHost,
-		"-p", config.PGPort,
-		"-U", config.PGUser,
-		"-f", outputPath,
-	)
-	cmd.Env = append(os.Environ(), fmt.Sprintf("PGPASSWORD=%s", config.PGPassword))
-	return runCmd(cmd)
-}
-
-func runCmd(cmd *exec.Cmd) error {
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	if err != nil {
-		return fmt.Errorf("%v: %s", err, stderr.String())
-	}
-	return nil
+func safeFileSegment(s string) string {
+	return unsafePathChars.ReplaceAllString(s, "_")
 }
 
 type SignedURLResponse struct {
@@ -204,13 +207,12 @@ type SignedURLResponse struct {
 }
 
 func getSignedURL(config Config, filename string) (string, error) {
-	date := time.Now().Format("20060102")
+	date := time.Now().UTC().Format("20060102")
 	url := fmt.Sprintf("https://ziqx.cc/api/drive/sign-url?filename=%s&folder=%s", filename, date)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return "", err
 	}
-
 	req.Header.Set("x-drive-key", config.ZDriveKey)
 	req.Header.Set("x-drive-secret", config.ZDriveSecret)
 
@@ -230,12 +232,27 @@ func getSignedURL(config Config, filename string) (string, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		return "", err
 	}
-
 	if !res.Success {
 		return "", fmt.Errorf("signed URL request returned success=false: %s", res.Message)
 	}
-
 	return res.URL, nil
+}
+
+func uploadWithRetry(uploadURL, filePath, filename string, attempts int) error {
+	var lastErr error
+	for i := 1; i <= attempts; i++ {
+		err := uploadToZDrive(uploadURL, filePath, filename)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if i < attempts {
+			backoff := time.Duration(1<<uint(i-1)) * 5 * time.Second
+			log.Printf("Upload attempt %d/%d failed: %v. Retrying in %s...", i, attempts, err, backoff)
+			time.Sleep(backoff)
+		}
+	}
+	return lastErr
 }
 
 func uploadToZDrive(uploadURL, filePath, filename string) error {
@@ -245,25 +262,41 @@ func uploadToZDrive(uploadURL, filePath, filename string) error {
 	}
 	defer file.Close()
 
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-	part, err := writer.CreateFormFile("file", filename)
-	if err != nil {
-		return err
-	}
-	_, err = io.Copy(part, file)
-	if err != nil {
-		return err
-	}
-	writer.Close()
+	pr, pw := io.Pipe()
+	mpWriter := multipart.NewWriter(pw)
 
-	req, err := http.NewRequest("POST", uploadURL, body)
+	go func() {
+		var copyErr error
+		defer func() {
+			if copyErr != nil {
+				pw.CloseWithError(copyErr)
+				return
+			}
+			if err := mpWriter.Close(); err != nil {
+				pw.CloseWithError(err)
+				return
+			}
+			pw.Close()
+		}()
+
+		part, err := mpWriter.CreateFormFile("file", filename)
+		if err != nil {
+			copyErr = err
+			return
+		}
+		if _, err := io.Copy(part, file); err != nil {
+			copyErr = err
+			return
+		}
+	}()
+
+	req, err := http.NewRequest("POST", uploadURL, pr)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Content-Type", mpWriter.FormDataContentType())
 
-	client := &http.Client{Timeout: 1 * time.Hour} // Backups can be large
+	client := &http.Client{Timeout: 1 * time.Hour}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -274,6 +307,5 @@ func uploadToZDrive(uploadURL, filePath, filename string) error {
 		respBody, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("upload failed with status %d: %s", resp.StatusCode, string(respBody))
 	}
-
 	return nil
 }
